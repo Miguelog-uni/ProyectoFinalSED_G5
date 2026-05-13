@@ -3,6 +3,10 @@
 Proyecto final de sistemas empotrados distribuidos, consistente en realizar un sistema de medición de calidad del aire por medio una placa ESP32-C3 y una ESP32-v4. 
 Se utilizan dos nodos de ESP32 comunicados mediante MQTT, uno sensor y otro visualizador.
 
+
+# Demo
+
+[Ver vídeo demostración del sistema](https://youtu.be/LuD_7VrAqLw)
 ---
 
 # Nodos
