@@ -1,0 +1,53 @@
+# ===== ESP-IDF =====
+
+build/
+managed_components/
+dependencies.lock
+
+# ===== ESP-IDF config backups =====
+
+sdkconfig.old
+
+# ===== IDEs =====
+
+.vscode/
+.idea/
+
+# ===== Python =====
+
+__pycache__/
+*.pyc
+
+# ===== OS files =====
+
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+
+*.log
+
+# ===== Temporary files =====
+
+*.tmp
+*.swp
+*~
+
+# ===== Serial monitor dumps =====
+
+monitor.txt
+
+# ===== CMake =====
+
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# ===== Ninja =====
+
+.ninja_deps
+.ninja_log
+
+# ===== Compilation database =====
+
+compile_commands.json
