@@ -51,3 +51,6 @@ cmake_install.cmake
 # ===== Compilation database =====
 
 compile_commands.json
+
+# ===== Video =====
+*.mp4
