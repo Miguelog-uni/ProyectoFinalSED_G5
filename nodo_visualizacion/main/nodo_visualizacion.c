@@ -34,6 +34,15 @@ static float last_hum = 0.0f;
 static int last_eco2 = 400;
 static int last_tvoc = 0;
 
+static bool wifi_connected = false;
+static bool mqtt_connected = false;
+static bool reconnect_task_running = false;
+
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+
+#define WIFI_RECONNECT_MS 10000
+#define MQTT_RECONNECT_MS 15000
+
 static void actualizar_semaforo(void)
 {
     gpio_set_level(LED_VERDE, 0);
@@ -90,6 +99,80 @@ static void init_leds(void)
     gpio_set_level(LED_ROJO, 0);
 }
 
+static void wifi_reconnect_task(void *pvParameters)
+{
+    while (!wifi_connected) {
+        ESP_LOGW(TAG, "Reintentando conexión WiFi...");
+
+        esp_err_t ret = esp_wifi_connect();
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "esp_wifi_connect falló: %s", esp_err_to_name(ret));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_MS));
+    }
+
+    reconnect_task_running = false;
+    vTaskDelete(NULL);
+}
+
+static void mqtt_reconnect_task(void *pvParameters)
+{
+    while (1) {
+        if (wifi_connected && !mqtt_connected && mqtt_client != NULL) {
+            ESP_LOGW(TAG, "Reintentando conexión MQTT...");
+            esp_mqtt_client_reconnect(mqtt_client);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(MQTT_RECONNECT_MS));
+    }
+}
+
+static void wifi_event_handler(void *arg,
+                               esp_event_base_t event_base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "WiFi conectado al AP");
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disc = event_data;
+
+        wifi_connected = false;
+        mqtt_connected = false;
+
+        ESP_LOGW(TAG, "WiFi desconectado. reason=%d", disc->reason);
+
+        if (!reconnect_task_running) {
+            reconnect_task_running = true;
+
+            xTaskCreate(
+                wifi_reconnect_task,
+                "wifi_reconnect_task",
+                4096,
+                NULL,
+                5,
+                NULL
+            );
+        }
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = event_data;
+
+        wifi_connected = true;
+
+        ESP_LOGI(TAG, "IP obtenida: " IPSTR, IP2STR(&event->ip_info.ip));
+
+        if (mqtt_client != NULL) {
+            esp_mqtt_client_reconnect(mqtt_client);
+        }
+    }
+}
+
 static void wifi_init_sta(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -99,6 +182,20 @@ static void wifi_init_sta(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_EVENT,
+        ESP_EVENT_ANY_ID,
+        &wifi_event_handler,
+        NULL
+    ));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        IP_EVENT,
+        IP_EVENT_STA_GOT_IP,
+        &wifi_event_handler,
+        NULL
+    ));
 
     wifi_config_t wifi_config = {
         .sta = {
@@ -127,6 +224,8 @@ static void mqtt_event_handler(
     switch ((esp_mqtt_event_id_t)event_id) {
 
     case MQTT_EVENT_CONNECTED:
+        mqtt_connected = true;
+
         ESP_LOGI(TAG, "Conectado al broker MQTT");
 
         esp_mqtt_client_publish(
@@ -144,7 +243,6 @@ static void mqtt_event_handler(
         esp_mqtt_client_subscribe(client, TOPIC_TVOC, 1);
 
         ESP_LOGI(TAG, "Suscrito a tópicos de sensores");
-
         break;
 
     case MQTT_EVENT_DATA: {
@@ -189,7 +287,10 @@ static void mqtt_event_handler(
     }
 
     case MQTT_EVENT_DISCONNECTED:
+        mqtt_connected = false;
+
         ESP_LOGW(TAG, "MQTT desconectado");
+
         gpio_set_level(LED_VERDE, 0);
         gpio_set_level(LED_AMARILLO, 0);
         gpio_set_level(LED_ROJO, 0);
@@ -255,5 +356,14 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    mqtt_app_start();
+    mqtt_client = mqtt_app_start();
+
+    xTaskCreate(
+        mqtt_reconnect_task,
+        "mqtt_reconnect_task",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
 }

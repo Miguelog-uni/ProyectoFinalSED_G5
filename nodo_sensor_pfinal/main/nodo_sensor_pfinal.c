@@ -11,7 +11,6 @@
 #include "driver/i2c_master.h"
 
 #include "ultrasonic.h"
-#include "sgp30.h"
 
 #include <stdbool.h>
 
@@ -21,6 +20,15 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
+
+#include "esp_ota_ops.h"
+#include <inttypes.h>
+
+#include <esp_mac.h>
+#include "mender-client.h"
+#include "mender-flash.h"
+
+#define VERSION "1.0.3"
 
 #define I2C_PORT        I2C_NUM_0
 #define SDA_GPIO        GPIO_NUM_21
@@ -45,6 +53,11 @@
 #define SGP30_CMD_MEASURE_IAQ_1   0x20
 #define SGP30_CMD_MEASURE_IAQ_2   0x08
 
+#define WIFI_RECONNECT_MS       5000
+#define MQTT_RECONNECT_MS       5000
+#define TELEMETRY_PERIOD_MS     2000
+#define WIFI_STARTUP_DELAY_MS   5000
+
 #define TOPIC_TEMP      "sed/GXX/sensor/temp"
 #define TOPIC_HUM       "sed/GXX/sensor/hum"
 #define TOPIC_ECO2      "sed/GXX/sensor/eco2"
@@ -68,6 +81,33 @@ static i2c_master_dev_handle_t sgp30_handle;
 static i2c_master_bus_handle_t i2c_bus_handle;
 static i2c_master_dev_handle_t si7021_handle;
 static ultrasonic_sensor_t ultrasonic;
+
+// --- Variables globales
+mender_client_config_t mender_config;
+mender_client_callbacks_t mender_callbacks;
+mender_keystore_t mender_identity[2];
+char mender_mac_address[18];
+// --- Callbacks
+static mender_err_t mender_network_connect_cb(void) { return MENDER_OK; }
+static mender_err_t mender_network_release_cb(void) { return MENDER_OK; }
+static mender_err_t mender_auth_failure_cb(void) { return MENDER_OK; }
+
+static mender_err_t mender_deployment_status_cb(mender_deployment_status_t status, char *desc) {
+    ESP_LOGI("MENDER", "Estado del despliegue: %s", desc ? desc : "Desconocido");
+    return MENDER_OK;
+}
+
+static mender_err_t mender_auth_success_cb(void) {
+    ESP_LOGI("MENDER", "Autenticacion exitosa con el servidor");
+    // Esto es VITAL: le dice al ESP32 que el firmware funciona y no debe volver a la versión anterior
+    return mender_flash_confirm_image();
+}
+
+static mender_err_t mender_restart_cb(void) {
+    ESP_LOGI("MENDER", "Reiniciando el sistema por peticion de OTA...");
+    esp_restart();
+    return MENDER_OK;
+}
 
 /* ===== SI7021 y SGP30 con driver I2C nuevo ===== */
 
@@ -126,7 +166,7 @@ static esp_err_t si7021_read_humidity(float *humidity)
     return ESP_OK;
 }
 
-static esp_err_t sgp30_read_iaq(uint16_t *eco2, uint16_t *tvoc)
+static esp_err_t sgp30_read_air_quality(uint16_t *eco2, uint16_t *tvoc)
 {
     uint8_t cmd[2] = {
         SGP30_CMD_MEASURE_IAQ_1,
@@ -254,7 +294,7 @@ static esp_err_t init_sgp30(void)
 }
 
 
-static void init_sensors(void)
+static void sensors_init(void)
 {
     esp_err_t ret_i2c = init_i2c_bus();
 
@@ -298,48 +338,6 @@ static void init_sensors(void)
     }
 }
 
-/* ===== Lectura de sensores ===== */
-
-static esp_err_t read_sensors(void)
-{
-    esp_err_t result = ESP_OK;
-
-    if (si7021_available) {
-        float temperature = 0.0f;
-        float humidity = 0.0f;
-
-        esp_err_t ret_temp = si7021_read_temperature(&temperature);
-        esp_err_t ret_hum = si7021_read_humidity(&humidity);
-
-        if (ret_temp == ESP_OK && ret_hum == ESP_OK) {
-            ESP_LOGI(TAG, "Temperatura: %.2f ºC | Humedad: %.2f %%",
-                     temperature, humidity);
-        } else {
-            ESP_LOGW(TAG, "Error leyendo Si7021");
-            result = ESP_FAIL;
-        }
-    } else {
-        ESP_LOGW(TAG, "Si7021 no disponible, lectura omitida");
-    }
-
-    if (sgp30_available) {
-        uint16_t eco2 = 0;
-        uint16_t tvoc = 0;
-
-        esp_err_t ret_sgp = sgp30_read_iaq(&eco2, &tvoc);
-
-        if (ret_sgp == ESP_OK) {
-            ESP_LOGI(TAG, "eCO2: %u ppm | TVOC: %u ppb", eco2, tvoc);
-        } else {
-            ESP_LOGW(TAG, "Error leyendo SGP30: %s", esp_err_to_name(ret_sgp));
-        }
-    } else {
-        ESP_LOGW(TAG, "SGP30 no disponible, lectura omitida");
-    }
-
-    return result;
-}
-
 // si se desconecta, intentar a los 10 segundos reconectar al wifi
 static void wifi_reconnect_task(void *pvParameters)
 {
@@ -352,7 +350,7 @@ static void wifi_reconnect_task(void *pvParameters)
             ESP_LOGW(TAG, "esp_wifi_connect falló: %s", esp_err_to_name(ret));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_MS));
     }
 
     reconnect_task_running = false;
@@ -368,7 +366,7 @@ static void mqtt_reconnect_task(void *pvParameters)
             esp_mqtt_client_reconnect(mqtt_client);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(15000));
+        vTaskDelay(pdMS_TO_TICKS(MQTT_RECONNECT_MS));
     }
 }
 
@@ -483,6 +481,15 @@ static void mqtt_event_handler(
         }
 }
 
+static void mqtt_publish_if_connected(const char *topic, const char *payload)
+{
+    if (mqtt_connected && mqtt_client != NULL) {
+        esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+    } else {
+        ESP_LOGW(TAG, "MQTT no conectado. %s", topic);
+    }
+}
+
 static esp_mqtt_client_handle_t mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -514,7 +521,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
     return client;
 }
 
-static void task_telemetria(void *pvParameters)
+static void sensor_publish_task(void *pvParameters)
 {
     char payload[32];
 
@@ -534,14 +541,14 @@ static void task_telemetria(void *pvParameters)
 
             if (ret == ESP_OK) {
 
-                ESP_LOGI(TAG, "Distancia: %lu cm", distance_cm);
+                ESP_LOGD(TAG, "Distancia: %lu cm", distance_cm);
 
                 if (distance_cm > 0 &&
                     distance_cm < PRESENCE_CM) {
 
                     presence_detected = true;
 
-                    ESP_LOGI(TAG, "Presencia detectada");
+                    ESP_LOGI(TAG, "Presencia detectada a %lu cm", distance_cm);
                 }
             }
         }
@@ -566,28 +573,14 @@ static void task_telemetria(void *pvParameters)
                              "%.2f",
                              temperature);
 
-                    esp_mqtt_client_publish(
-                        mqtt_client,
-                        TOPIC_TEMP,
-                        payload,
-                        0,
-                        1,
-                        0
-                    );
+                    mqtt_publish_if_connected(TOPIC_TEMP, payload);
 
                     snprintf(payload,
                              sizeof(payload),
                              "%.2f",
                              humidity);
 
-                    esp_mqtt_client_publish(
-                        mqtt_client,
-                        TOPIC_HUM,
-                        payload,
-                        0,
-                        1,
-                        0
-                    );
+                    mqtt_publish_if_connected(TOPIC_HUM, payload);
 
                     ESP_LOGI(TAG,
                              "Temp: %.2f | Hum: %.2f",
@@ -603,35 +596,21 @@ static void task_telemetria(void *pvParameters)
                 uint16_t eco2 = 0;
                 uint16_t tvoc = 0;
 
-                if (sgp30_read_iaq(&eco2, &tvoc) == ESP_OK) {
+                if (sgp30_read_air_quality(&eco2, &tvoc) == ESP_OK) {
 
                     snprintf(payload,
                              sizeof(payload),
                              "%u",
                              eco2);
 
-                    esp_mqtt_client_publish(
-                        mqtt_client,
-                        TOPIC_ECO2,
-                        payload,
-                        0,
-                        1,
-                        0
-                    );
+                    mqtt_publish_if_connected(TOPIC_ECO2, payload);
 
                     snprintf(payload,
                              sizeof(payload),
                              "%u",
                              tvoc);
 
-                    esp_mqtt_client_publish(
-                        mqtt_client,
-                        TOPIC_TVOC,
-                        payload,
-                        0,
-                        1,
-                        0
-                    );
+                    mqtt_publish_if_connected(TOPIC_TVOC, payload);
 
                     ESP_LOGI(TAG,
                              "eCO2: %u | TVOC: %u",
@@ -641,14 +620,21 @@ static void task_telemetria(void *pvParameters)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
     }
 }
 /* ===== MAIN ===== */
 
 void app_main(void)
 {
-    init_sensors();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    printf("--- SISTEMA INICIADO ---\n");
+    printf("Versión de Firmware: %s\n", VERSION);
+    printf("Ejecutando desde partición: %s\n", running->label);
+    printf("Dirección Offset: 0x%08" PRIx32 "\n", running->address);
+
+    // Inicialización de los sensores
+    sensors_init();
 
     esp_err_t ret = nvs_flash_init();
 
@@ -664,7 +650,7 @@ void app_main(void)
 
     wifi_init_sta();
 
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    vTaskDelay(pdMS_TO_TICKS(WIFI_STARTUP_DELAY_MS));
 
     mqtt_client = mqtt_app_start();
 
@@ -678,11 +664,51 @@ void app_main(void)
     );
 
     xTaskCreate(
-        task_telemetria,
+        sensor_publish_task,
         "task_telemetria",
         4096,
         NULL,
         5,
         NULL
     );
+
+    // --- INICIO CONFIGURACIN MENDER ---
+    // 1. Obtener la dirección MAC (Mender la exige como identificador único)
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    sprintf(mender_mac_address, "%02x:%02x:%02x:%02x:%02x:%02x",
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    // 2. Identidad
+    mender_identity[0].name = "mac";
+    mender_identity[0].value = mender_mac_address;
+    mender_identity[1].name = NULL;
+    mender_identity[1].value = NULL;
+
+    // 3. Configurar los parámetros
+    mender_config.identity = mender_identity;
+    mender_config.artifact_name = VERSION;
+    mender_config.device_type = "esp32";
+    mender_config.host = CONFIG_MENDER_SERVER_HOST;
+    mender_config.tenant_token = CONFIG_MENDER_SERVER_TENANT_TOKEN;
+    mender_config.authentication_poll_interval = 60;
+    mender_config.update_poll_interval = 60;
+    mender_config.recommissioning = false;
+
+    // 4. Definir los callbacks obligatorios
+    mender_callbacks.network_connect = mender_network_connect_cb;
+    mender_callbacks.network_release = mender_network_release_cb;
+    mender_callbacks.authentication_success = mender_auth_success_cb;
+    mender_callbacks.authentication_failure = mender_auth_failure_cb;
+    mender_callbacks.deployment_status = mender_deployment_status_cb;
+    mender_callbacks.restart = mender_restart_cb;
+
+    // 5. Arrancar el cliente Mender en segundo plano
+    ESP_LOGI("MENDER", "Iniciando cliente con MAC: %s", mender_mac_address);
+    if (mender_client_init(&mender_config, &mender_callbacks) == MENDER_OK) {
+        mender_client_activate(); // Esto pone a Mender a funcionar en segundo plano!
+    } else {
+        ESP_LOGE("MENDER", "Fallo al inicializar Mender");
+    }
+    // --- FIN CONFIGURACIN MENDER ---
 }
