@@ -1,5 +1,5 @@
 # ===== ESP-IDF =====
-
+external/
 build/
 managed_components/
 dependencies.lock
@@ -54,3 +54,4 @@ compile_commands.json
 
 # ===== Video =====
 *.mp4
+

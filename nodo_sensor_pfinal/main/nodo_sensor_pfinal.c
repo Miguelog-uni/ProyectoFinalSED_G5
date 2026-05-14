@@ -28,7 +28,7 @@
 #include "mender-client.h"
 #include "mender-flash.h"
 
-#define VERSION "1.0.3"
+#define VERSION "1.0.7"
 
 #define I2C_PORT        I2C_NUM_0
 #define SDA_GPIO        GPIO_NUM_21
